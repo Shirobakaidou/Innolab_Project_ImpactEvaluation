@@ -9,13 +9,6 @@ library(wdpar)
 library(tidyr)
 library(dplyr)
 
-# Ref:
-# About gdal virtual file system:
-# https://gis.stackexchange.com/questions/266838/gdal-warp-to-in-memory-raster
-# https://gis.stackexchange.com/questions/397451/why-does-vsimem-have-a-path
-# Read vrt files stored online using gdal virtual file system:
-# https://gis.stackexchange.com/questions/361086/reading-vrt-from-soilgrids-in-r
-
 country = "Madagascar"
 wdir = file.path(getwd(), 'data')
 
@@ -176,6 +169,7 @@ gdalwarp(srcfile = files_travel[1],
          ot = "UInt16")
 
 #------------------------------------------------------------
+#------------------------------------------------------------
 
 # Rasters --> Dataframe
 files_fc = list.files(file.path(getwd(), "data", "GDAL", "fc"),
@@ -186,29 +180,36 @@ files_travel = list.files(file.path(getwd(), "data", "GDAL", "travelTime"),
 rToDF = function(file){
   r = rast(file)
   df = as.data.frame(r, na.rm=TRUE, xy=TRUE, centroids=TRUE)
-}
+  }
 
-df_fc = do.call("rbind", lapply(files_fc, FUN = rToDF))
+df_fc = do.call("rbind", lapply(files_fc, FUN = rToDF)) %>%
+  # Transform warped rasters into dataframes, merge dfs by row
+  
+  # Turn df into projected geodataframe
+  st_as_sf(., coords = c("x", "y"),
+           crs = crs(gadm_prj)) %>%
+  
+  # Spatial join gdf with grid gdf, match unique gridID and observation
+  st_join(grid) %>% 
+  
+  # Remove observations not covered by grid
+  drop_na(gridID) %>%
+  
+  # Drop geometry, turn gdf into df, drop unneeded column
+  mutate(geometry = NULL) %>%
+  as.data.frame() %>%
+  select(-c(centroids)) %>%
+  
+  # Summarise observations with duplicated gridID
+  group_by(gridID) %>% 
+  summarise(across(everything(), list(sum)))
+  # Alternative: aggregate(.~gridID, gdf_fc, sum)
+
+
 df_travel = do.call("rbind", lapply(files_travel, FUN = rToDF))
-
-df_merge = full_join(df_fc, df_travel, by=c("x", "y"))
 
 gdf_travel = st_as_sf(df_travel,
                       coords = c("x", "y"),
                       crs = crs(gadm_prj)) %>%
   st_join(grid) %>% drop_na(gridID)
-
-
-
-r.warpSum = rast(files_fc[1])
-df = as.data.frame(r.warpSum, na.rm=TRUE, xy = TRUE, centroids = TRUE)
-
-# DF to sf object
-gdf = st_as_sf(df, 
-               coords = c("x", "y"), 
-               crs = crs(gadm_prj))
-
-gdf_aoi = gdf %>% st_join(gadm_prj) %>% drop_na(COUNTRY)
-
-
 
