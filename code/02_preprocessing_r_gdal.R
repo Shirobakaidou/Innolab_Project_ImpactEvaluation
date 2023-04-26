@@ -7,8 +7,9 @@ library(wdpar)
 library(tidyr)
 library(dplyr)
 
-country = "Madagascar"
-wdir = file.path(getwd(), 'data')
+country = "Cameroon"
+path.input = file.path(getwd(), 'data', 'input', 'Cameroon')
+path.output = file.path(getwd(), 'data', 'output', 'Cameroon')
 
 # Specify buffer width in meter
 buffer_m = 10000
@@ -17,12 +18,13 @@ buffer_m = 10000
 gridSize = 1000
 
 # Specify a list of WDPA IDs of funded protected areas (treated areas)
-paid = c(5037, 2303, 5024, 303698, 303702, 26072, 5028, 303695, 20272, 20287, 20273)
-
+#paid = c(5037, 2303, 5024, 303698, 303702, 26072, 5028, 303695, 20272, 20287, 20273)
+# IDs of funded PAs in Cameroon
+paid = c(20058, 555547996, 555547994, 20112)
 
 #--------------------------------------------------------------
 # Vector: Reproject GADM ####
-gadm <- gadm(country = country, resolution = 1, level = 0, path = wdir) %>%
+gadm <- gadm(country = country, resolution = 1, level = 0, path = path.input) %>%
   st_as_sf()
 
 # Find UTM zone of the country centroid
@@ -41,8 +43,8 @@ utm_code = lonlat2UTM(centroid)
 gadm_prj = gadm %>% st_transform(crs = utm_code)
 
 # Export projected GADM for use in GDAL
-st_write(test, 
-         dsn = file.path(wdir, "group_prj.gpkg"), delete_dsn = TRUE) 
+st_write(gadm_prj, 
+         dsn = file.path(path.input, "gadm_prj.gpkg"), delete_dsn = TRUE) 
 
 # Make bounding box of projected country polygon
 bbox = st_bbox(gadm_prj) %>% st_as_sfc() %>% st_as_sf() 
@@ -64,9 +66,9 @@ rm(grid.sub)
 
 # Get the PA polygons/points of the specified country; 
 # They're downloaded to the working directory.
-wdpa = wdpa_fetch(country, wait = TRUE, download_dir = wdir)
+wdpa = wdpa_fetch(country, wait = TRUE, download_dir = path.input)
 # If the PA file already exists, it can be loaded in this way
-#wdpa = wdpa_read(paste0(wdir, '/WDPA_Dec2022_MDG-shapefile.zip'))
+#wdpa = wdpa_read(paste0(path.input, '/WDPA_Dec2022_MDG-shapefile.zip'))
 
 
 # PAs are projected, and column "geometry_type" is added
@@ -119,86 +121,62 @@ names(r.wdpaid) = "wdpaid"
 
 #-------------------------------------------------------------
 # GDAL WARP ####
-files = list.files(path = file.path(getwd(), "data", "GEE", "fc"), 
-                   full.names = TRUE)
 
-fInfo = gdal_utils(util = "info",
-                   source = files[1])
+# Warp Forest Cover
+f.fc = Sys.glob(file.path(path.input, 'fc*'))
 
-
-gdalwarp(srcfile = files[8],
-         dstfile = file.path(getwd(), "data", "GDAL", "fc", "fcSum_1km_8.tiff"), # Output file in GDAL virtual file system
+fun.warp.fc = function(file){
+  newname = paste0("warped-", tail(strsplit(file, '/')[[1]], 1))
+  gdalwarp(srcfile = file,
+         dstfile = file.path(path.output, newname), # Output file in GDAL virtual file system
          t_srs = paste0("EPSG:", utm_code),
-         tr = c("1000", "1000"),
+         tr = c(as.character(gridSize), as.character(gridSize)),
          r = "sum",
-         ot = "UInt16")
-         #cutline = file.path(getwd(), "country_prj.gpkg"),
-         #crop_to_cutline = TRUE
+         ot = "UInt16")}
 
-# Travel Time
-files_travel = list.files(path = file.path(getwd(), "data", "GEE", "travelTime"), 
-                          full.names = TRUE)
+lapply(f.fc, fun.warp.fc)
 
-gdalwarp(srcfile = files_travel[1],
-         dstfile = file.path(getwd(), "data", "GDAL", "travelTime", "travelMean_1km.tiff"), # Output file in GDAL virtual file system
+#----------------------------------
+# Terrain Ruggedness Index (TRI)
+f.dem = Sys.glob(file.path(path.input, 'srtm*'))
+
+fun.tri = function(file){
+  gdaldem(mode = "TRI", 
+        input_dem = file,
+        output_map = file.path(path.input, "tri.tif"))
+}
+
+lapply(f.dem, fun.tri)
+
+
+#--------------------------------
+# Warp Other Variables: travel time, elevation, tri, clay content
+f.others = Sys.glob(file.path(path.input, '[!f]*.tif'))
+
+fun.warp.other = function(file){
+  newname = paste0("warped-", tail(strsplit(file, '/')[[1]], 1))
+  gdalwarp(srcfile = file,
+         dstfile = file.path(path.output, newname), # Output file in GDAL virtual file system
          t_srs = paste0("EPSG:", utm_code),
-         tr = c("1000", "1000"),
+         tr = c(as.character(gridSize), as.character(gridSize)),
          r = "average",
          ot = "UInt16")
+}
 
-# Clay Content
-files_clay = list.files(path = file.path(getwd(), "data", "GEE", "clay"),
-                        full.names = TRUE)
+lapply(f.others, fun.warp.other)
 
-gdalwarp(srcfile = files_clay[1],
-         dstfile = file.path(getwd(), "data", "GDAL", "clay", "clayMean_1km.tiff"), # Output file in GDAL virtual file system
-         t_srs = paste0("EPSG:", utm_code),
-         tr = c("1000", "1000"),
-         r = "average",
-         ot = "UInt16")
-
-# DEM and TRI
-files_dem = list.files(path = file.path(getwd(), "data", "GEE", "dem"),
-                        full.names = TRUE)
-
-gdalwarp(srcfile = files_dem[1],
-         dstfile = file.path(getwd(), "data", "GDAL", "dem", "demMean_1km.tiff"), 
-         t_srs = paste0("EPSG:", utm_code),
-         tr = c("1000", "1000"),
-         r = "average",
-         ot = "UInt16")
-
-gdaldem(mode = "TRI", input_dem = files_dem[1],
-        output_map = file.path(getwd(), "data", "GEE", "dem", "tri.tiff"))
-
-gdalwarp(srcfile = files_dem[2],
-         dstfile = file.path(getwd(), "data", "GDAL", "dem", "triMean_1km.tiff"), 
-         t_srs = paste0("EPSG:", utm_code),
-         tr = c("1000", "1000"),
-         r = "average",
-         ot = "UInt16")
 
 #------------------------------------------------------------
-#------------------------------------------------------------
-
 # Rasters --> Dataframe
-files_fc = list.files(file.path(getwd(), "data", "GDAL", "fc"),
-                      full.names = TRUE)
-files_travel = list.files(file.path(getwd(), "data", "GDAL", "travelTime"),
-                      full.names = TRUE)
-files_clay = list.files(file.path(getwd(), "data", "GDAL", "clay"),
-                          full.names = TRUE)
-files_dem = list.files(file.path(getwd(), "data", "GDAL", "dem"),
-                          full.names = TRUE)
-files_tri = list.files(file.path(getwd(), "data", "GDAL", "tri"),
-                       full.names = TRUE)
 
 rToDF = function(file){
   r = rast(file)
   df = as.data.frame(r, na.rm=TRUE, xy=TRUE, centroids=TRUE)
-  }
+}
 
-df_fc = do.call("rbind", lapply(files_fc, FUN = rToDF)) %>%
+# Forest Cover
+f.fc = Sys.glob(file.path(path.output, '*fc*'))
+df.fc = do.call("rbind", lapply(f.fc, FUN = rToDF)) %>%
   # Transform warped rasters into dataframes, merge dfs by row
   
   # Turn df into projected geodataframe
@@ -222,7 +200,9 @@ df_fc = do.call("rbind", lapply(files_fc, FUN = rToDF)) %>%
   # Alternative: aggregate(.~gridID, gdf_fc, sum)
 
 
-df_travel = do.call("rbind", lapply(files_travel, FUN = rToDF)) %>%
+# Travel Time
+f.travel = Sys.glob(file.path(path.output, '*travel*'))
+df.travel = do.call("rbind", lapply(f.travel, FUN = rToDF)) %>%
   st_as_sf(., coords = c("x", "y"),
            crs = crs(gadm_prj)) %>%
   st_join(grid) %>% 
@@ -233,7 +213,10 @@ df_travel = do.call("rbind", lapply(files_travel, FUN = rToDF)) %>%
   group_by(gridID) %>% 
   summarise(across(everything(), list(mean)))
 
-df_clay = do.call("rbind", lapply(files_clay, FUN = rToDF)) %>%
+
+# Clay Content
+f.clay = Sys.glob(file.path(path.output, '*clay*'))
+df.clay = do.call("rbind", lapply(f.clay, FUN = rToDF)) %>%
   st_as_sf(., coords = c("x", "y"),
            crs = crs(gadm_prj)) %>%
   st_join(grid) %>% 
@@ -244,7 +227,10 @@ df_clay = do.call("rbind", lapply(files_clay, FUN = rToDF)) %>%
   group_by(gridID) %>% 
   summarise(across(everything(), list(mean)))
 
-df_dem = do.call("rbind", lapply(files_dem, FUN = rToDF)) %>%
+
+# DEM
+f.dem = Sys.glob(file.path(path.output, '*srtm*'))
+df.dem = do.call("rbind", lapply(f.dem, FUN = rToDF)) %>%
   st_as_sf(., coords = c("x", "y"),
            crs = crs(gadm_prj)) %>%
   st_join(grid) %>% 
@@ -255,7 +241,10 @@ df_dem = do.call("rbind", lapply(files_dem, FUN = rToDF)) %>%
   group_by(gridID) %>% 
   summarise(across(everything(), list(mean)))
 
-df_tri = do.call("rbind", lapply(files_tri, FUN = rToDF)) %>%
+
+# TRI
+f.tri = Sys.glob(file.path(path.output, '*tri*'))
+df.tri = do.call("rbind", lapply(f.tri, FUN = rToDF)) %>%
   st_as_sf(., coords = c("x", "y"),
            crs = crs(gadm_prj)) %>%
   st_join(grid) %>% 
@@ -266,7 +255,9 @@ df_tri = do.call("rbind", lapply(files_tri, FUN = rToDF)) %>%
   group_by(gridID) %>% 
   summarise(across(everything(), mean))
 
-df_group = rToDF(r.group) %>%
+
+# Groups and WDPA-ID
+df.group = rToDF(r.group) %>%
   st_as_sf(., coords = c("x", "y"),
            crs = crs(gadm_prj)) %>%
   st_join(grid) %>%
@@ -278,7 +269,7 @@ df_group = rToDF(r.group) %>%
   group_by(gridID) %>% 
   summarise(across(everything(), max))
 
-df_wdpaID = rToDF(r.wdpaid) %>%
+df.wdpaid = rToDF(r.wdpaid) %>%
   st_as_sf(., coords = c("x", "y"),
            crs = crs(gadm_prj)) %>%
   st_join(grid) %>%
@@ -289,21 +280,19 @@ df_wdpaID = rToDF(r.wdpaid) %>%
   group_by(gridID) %>% 
   summarise(across(everything(), max))
 
-df_grid = df_group %>% inner_join(df_wdpaID)
-rm(df_group, df_wdpaID)
+df.grid = df.group %>% inner_join(df.wdpaid)
+rm(df.group, df.wdpaid)
 
 mf = grid %>%
-  inner_join(df_grid) %>%
-  inner_join(df_fc) %>%
-  inner_join(df_dem) %>%
-  inner_join(df_tri) %>%
-  inner_join(df_travel) %>%
-  inner_join(df_clay) #%>%
-  inner_join(grid) %>%
-  st_as_sf(., coords)
+  inner_join(df.grid) %>%
+  inner_join(df.fc) %>%
+  inner_join(df.dem) %>%
+  inner_join(df.tri) %>%
+  inner_join(df.travel) %>%
+  inner_join(df.clay) 
 
 # Export projected GADM for use in GDAL
 st_write(mf, 
-         dsn = file.path(wdir, "mf_rBase_1km.gpkg"), 
+         dsn = file.path(path.output, "mf_rBase_1km.gpkg"), 
          delete_dsn = TRUE) 
   
