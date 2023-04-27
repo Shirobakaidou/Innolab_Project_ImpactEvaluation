@@ -7,9 +7,9 @@ library(wdpar)
 library(tidyr)
 library(dplyr)
 
-country = "Cameroon"
-path.input = file.path(getwd(), 'data', 'input', 'Cameroon')
-path.output = file.path(getwd(), 'data', 'output', 'Cameroon')
+country = "Madagascar"
+path.input = file.path(getwd(), 'data', 'input', country)
+path.output = file.path(getwd(), 'data', 'output', country)
 
 # Specify buffer width in meter
 buffer_m = 10000
@@ -18,9 +18,9 @@ buffer_m = 10000
 gridSize = 1000
 
 # Specify a list of WDPA IDs of funded protected areas (treated areas)
-#paid = c(5037, 2303, 5024, 303698, 303702, 26072, 5028, 303695, 20272, 20287, 20273)
+paid = c(5037, 2303, 5024, 303698, 303702, 26072, 5028, 303695, 20272, 20287, 20273)
 # IDs of funded PAs in Cameroon
-paid = c(20058, 555547996, 555547994, 20112)
+#paid = c(20058, 555547996, 555547994, 20112)
 
 #--------------------------------------------------------------
 # Vector: Reproject GADM ####
@@ -141,9 +141,10 @@ lapply(f.fc, fun.warp.fc)
 f.dem = Sys.glob(file.path(path.input, 'srtm*'))
 
 fun.tri = function(file){
+  newname = paste0("tri-", tail(strsplit(file, '/')[[1]], 1))
   gdaldem(mode = "TRI", 
         input_dem = file,
-        output_map = file.path(path.input, "tri.tif"))
+        output_map = file.path(path.input, newname))
 }
 
 lapply(f.dem, fun.tri)
@@ -215,8 +216,7 @@ df.fc = df.fc %>%
   mutate_at(newnames, ~replace(., .>100, 100))
   # if value > 100% due to bias, set it to 100%
   
-  
-  
+
 #-------------------
 # Travel Time
 f.travel = Sys.glob(file.path(path.output, '*travel*'))
@@ -230,6 +230,8 @@ df.travel = do.call("rbind", lapply(f.travel, FUN = rToDF)) %>%
   select(-c(centroids)) %>%
   group_by(gridID) %>% 
   summarise(across(everything(), list(mean)))
+# Rename Column
+colnames(df.travel)[2] = "accessiblity_min"
 
 
 # Clay Content
@@ -244,10 +246,12 @@ df.clay = do.call("rbind", lapply(f.clay, FUN = rToDF)) %>%
   select(-c(centroids)) %>%
   group_by(gridID) %>% 
   summarise(across(everything(), list(mean)))
+# Rename Column
+colnames(df.clay)[2] = "clay_%_mean_0_20"
 
 
 # DEM
-f.dem = Sys.glob(file.path(path.output, '*srtm*'))
+f.dem = Sys.glob(file.path(path.output, '*[!tri]-srtm*'))
 df.dem = do.call("rbind", lapply(f.dem, FUN = rToDF)) %>%
   st_as_sf(., coords = c("x", "y"),
            crs = crs(gadm_prj)) %>%
@@ -258,6 +262,8 @@ df.dem = do.call("rbind", lapply(f.dem, FUN = rToDF)) %>%
   select(-c(centroids)) %>%
   group_by(gridID) %>% 
   summarise(across(everything(), list(mean)))
+# Rename Column
+colnames(df.dem)[2] = "elevation_m"
 
 
 # TRI
@@ -272,6 +278,8 @@ df.tri = do.call("rbind", lapply(f.tri, FUN = rToDF)) %>%
   select(-c(centroids)) %>%
   group_by(gridID) %>% 
   summarise(across(everything(), mean))
+# Rename Column
+colnames(df.tri)[2] = "TRI"
 
 
 # Groups and WDPA-ID
@@ -311,6 +319,6 @@ mf = grid %>%
 
 # Export projected GADM for use in GDAL
 st_write(mf, 
-         dsn = file.path(path.output, "mf_rBase_1km.gpkg"), 
+         dsn = file.path(path.output, paste0("mf_rBase_1km_", country, ".gpkg")), 
          delete_dsn = TRUE) 
   
