@@ -174,6 +174,7 @@ rToDF = function(file){
   df = as.data.frame(r, na.rm=TRUE, xy=TRUE, centroids=TRUE)
 }
 
+#-------------------
 # Forest Cover
 f.fc = Sys.glob(file.path(path.output, '*fc*'))
 df.fc = do.call("rbind", lapply(f.fc, FUN = rToDF)) %>%
@@ -199,7 +200,24 @@ df.fc = do.call("rbind", lapply(f.fc, FUN = rToDF)) %>%
   summarise(across(everything(), list(sum)))
   # Alternative: aggregate(.~gridID, gdf_fc, sum)
 
+# Rename df.fc
+oldnames = colnames(df.fc)[-1]
+newnames = lapply(oldnames, function(i){
+  strsplit(i, "_")[[1]][3]
+})
+newnames = paste0("fc_%_", unlist(newnames))
+df.fc = df.fc %>% 
+  rename_with(~ newnames, .cols = oldnames)
 
+# Calculate forests cover percentage in grid cells
+df.fc = df.fc %>%
+  mutate_at(newnames, ~round((.*900)/(gridSize^2)*100, 1)) %>%
+  mutate_at(newnames, ~replace(., .>100, 100))
+  # if value > 100% due to bias, set it to 100%
+  
+  
+  
+#-------------------
 # Travel Time
 f.travel = Sys.glob(file.path(path.output, '*travel*'))
 df.travel = do.call("rbind", lapply(f.travel, FUN = rToDF)) %>%
