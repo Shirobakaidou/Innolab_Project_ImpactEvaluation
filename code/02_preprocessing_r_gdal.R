@@ -7,26 +7,20 @@ library(wdpar)
 library(tidyr)
 library(dplyr)
 
-country = "Madagascar"
-path.input = file.path(getwd(), 'data', 'input', country)
-path.output = file.path(getwd(), 'data', 'output', country)
+country = "MDG"
+path.input = file.path(getwd(), 'data', 'input', "Madagascar")
+path.output = file.path(getwd(), 'data', 'test')
 
 # Specify buffer width in meter
 buffer_m = 10000
-
 # Specify the grid cell size in meter
 gridSize = 1000
-
 # Specify a list of WDPA IDs of funded protected areas (treated areas)
 paid = c(5037, 2303, 5024, 303698, 303702, 26072, 5028, 303695, 20272, 20287, 20273)
-# IDs of funded PAs in Cameroon
-#paid = c(20058, 555547996, 555547994, 20112)
 
-#--------------------------------------------------------------
-# Vector: Reproject GADM ####
-gadm <- gadm(country = country, resolution = 1, level = 0, path = path.input) %>%
-  st_as_sf()
 
+# If the country polygon file already exists in working directory, it can be loaded into work space by
+gadm = readRDS(file.path(path.input, paste0('gadm41_',country,'_0_pk.rds'))) %>% st_as_sf()
 # Find UTM zone of the country centroid
 centroid = st_coordinates(st_centroid(gadm))
 lonlat2UTM = function(lonlat) {
@@ -38,48 +32,28 @@ lonlat2UTM = function(lonlat) {
   }
 }
 utm_code = lonlat2UTM(centroid)
-
 # Reproject GADM
 gadm_prj = gadm %>% st_transform(crs = utm_code)
-
-# Export projected GADM for use in GDAL
-st_write(gadm_prj, 
-         dsn = file.path(path.input, "gadm_prj.gpkg"), delete_dsn = TRUE) 
-
 # Make bounding box of projected country polygon
-bbox = st_bbox(gadm_prj) %>% st_as_sfc() %>% st_as_sf() 
+bbox_prj = st_bbox(gadm_prj) %>% st_as_sfc() %>% st_as_sf()
 
-# Make a Grid to the extent of the bounding box
-grid = st_make_grid(bbox, cellsize = c(gridSize,gridSize))
-
-# Crop Grid to the extent of country boundary by
-# subsetting to the grid cells that intersect with the country
-grid.sub = grid %>% 
-  st_intersects(gadm_prj, .) %>% 
-  unlist()
-# Filter the grid to the subset
-grid = grid[sort(grid.sub)] %>%
-  st_as_sf() %>%
-  mutate(gridID = seq(1:nrow(.))) # Add id for grid cells
-rm(grid.sub)
-# Vector: Groups (funded PA, non-funded PA, buffer, control candidates) ####
-
-# Get the PA polygons/points of the specified country; 
-# They're downloaded to the working directory.
-wdpa = wdpa_fetch(country, wait = TRUE, download_dir = path.input)
+###=====================WDPA===============================###
 # If the PA file already exists, it can be loaded in this way
-#wdpa = wdpa_read(paste0(path.input, '/WDPA_Dec2022_MDG-shapefile.zip'))
-
+wdpa = wdpa_read(Sys.glob(file.path(path.input, "WDPA*")))
 
 # PAs are projected, and column "geometry_type" is added
-wdpa_prj = wdpa_clean(wdpa, geometry_precision = 1000) %>%
+wdpa_prj = wdpa %>%
+  
+  wdpa_clean(retain_status = NULL,
+             erase_overlaps = FALSE,
+             exclude_unesco = FALSE,
+             verbose = TRUE) %>% 
+  # Drop geometry POINT
+  filter(GEOMETRY_TYPE != "POINT") %>%
   # Remove the PAs that are only proposed, or have geometry type "point"
   filter(STATUS != "Proposed") %>%
-  filter(GEOMETRY_TYPE != "POINT") %>%
   # Project PA polygons to the previously determined UTM zone
-  st_transform(crs = utm_code) 
-rm(wdpa)
-
+  st_transform(crs = utm_code)
 
 # Make Buffers of 10km around all protected areas
 buffer <- st_buffer(wdpa_prj, dist = buffer_m) %>% 
@@ -94,231 +68,244 @@ wdpa_nofund = wdpa_prj %>% filter(!WDPAID %in% wdpaID_funded) %>%
   mutate(group=2) # Assign an ID "2" to the non-funded PA group
 
 # Merge the dataframes of funded PAs, non-funded PAs and buffers
+# CAREFUL : the order of the arguments does matter. 
+## During rasterization, in case a cell of the raster is on both funded analysed and non-funded, 
+# we want the cell to take the WDPAID of the funded analysed.
 wdpa_groups = rbind(wdpa_funded, wdpa_nofund, buffer)
+# Subset to polygons that intersect with country boundary
+wdpa.sub = wdpa_groups %>% 
+  st_intersects(gadm_prj, .) %>% 
+  unlist()
+# Filter the PA+buffer to the subset
+wdpa_groups = wdpa_groups[sort(wdpa.sub),] %>%
+  st_as_sf()
 
-rm(buffer, wdpa_funded, wdpa_nofund)
-
-
+#------------------------------------------------------------
 # Initialize an empty raster to the spatial extent of the country
 r.ini = raster()
-extent(r.ini) = extent(bbox)
+# Assign CRS to raster
+crs(r.ini) = CRS(paste0('+init=EPSG:',utm_code))
+# Define Extent
+extent(r.ini) = extent(bbox_prj)
 # Specify the raster resolution as same as the pre-defined 'gridSize'
 res(r.ini) = gridSize
 
 # Assign the raster pixels with "Group" values, 
-# Take the minial value if a pixel is covered by overlapped polygons, so that PA Group ID has higher priority than Buffer ID.
+# Take the minimal value if a pixel is covered by overlapped polygons, so that PA Group ID has higher priority than Buffer ID.
 # Assign value "0" to the background pixels (control candidates group)
+# fun = "min" can lead to bad group assignment. This issue is developed and tackled below
 r.group = rasterize(wdpa_groups, r.ini, field="group", fun="min", background=0) %>%
   mask(., gadm_prj)
 # Rename Layer
 names(r.group) = "group"
 
 # Rasterize wdpaid
-r.wdpaid = rasterize(wdpa_prj, r.ini, field="WDPAID", fun="first", background=0) %>%
+## CAREFUL : as stated above, the wdpa_groups raster is ordered so that the first layer is the one of funded, analyzed PA. Thus one needs to have fun = "first"
+r.wdpaid = rasterize(wdpa_groups, r.ini, field="WDPAID", fun="first", background=0) %>%
   mask(., gadm_prj)
 names(r.wdpaid) = "wdpaid"
 
+# Export Rasters of "group" and "wdpaid"
+writeRaster(r.group, file.path(path.output,'r_group_test.tif'))
+writeRaster(r.wdpaid, file.path(path.output, 'r_wdpaid_test.tif'))
 
-#-------------------------------------------------------------
+###====================================================###
+
+# GDAL: Rasterize Bounding Box
+gdal_rasterize(src_datasource = file.path(path.output, "bboxMDG_prj.gpkg"), # Input
+               dst_filename = file.path(path.output, "r_bbox1.tif"), # Output
+               of = 'GTiff', # Format
+               ot = "Byte", # Output Type
+               co = c("COMPRESS=DEFLATE"),
+               a_nodata = NA,
+               tr = c(as.character(gridSize), as.character(gridSize)), # Pixel Resolution
+               #at = TRUE, # all touched
+               burn = 1)
+
+# GDAL: Rasterize Attribute "Group"
+gdal_rasterize(src_datasource = file.path(path.output, "wdpa_groups_MDG.gpkg"), # Input
+               dst_filename = file.path(path.output, "r_group.tif"), # Output
+               of = 'GTiff', # Format
+               ot = "Byte", # Output Type
+               co = c("COMPRESS=DEFLATE"),
+               a = "group", # The attribute to burn value
+               a_nodata = 0, # Assign specific no data value: 0 for control group
+               te = c(311443.29363404075, 7168029.484370736, 1095443.2936340407, 8678029.484370736),
+               tr = c(as.character(gridSize), as.character(gridSize)) # Pixel Resolution
+)
+
+# GDAL: Rasterize Attribute "WDPAID"
+gdal_rasterize(src_datasource = file.path(path.output, "wdpa_groups_MDG.gpkg"), # Input
+               dst_filename = file.path(path.output, "r_wdpaid.tif"), # Output
+               of = 'GTiff', # Format
+               ot = "Byte", # Output Type
+               co = c("COMPRESS=DEFLATE"),
+               a = "WDPAID", # The attribute to burn value
+               a_nodata = 0, # Assign specific no data value: 0 for control group
+               te = c(311443.29363404075, 7168029.484370736, 1095443.2936340407, 8678029.484370736),
+               tr = c(as.character(gridSize), as.character(gridSize)) # Pixel Resolution
+)
+
+
 # GDAL WARP ####
+#jsonlite::fromJSON(gdalinfo(file.path(path.output, "r_bbox.tif"),
+#         json = TRUE))
 
-# Warp Forest Cover
-f.fc = Sys.glob(file.path(path.input, 'fc*'))
+#------------------------------------------------------------
+# GDAL: Build VRT
+gdalbuildvrt(gdalfile = Sys.glob(file.path(path.input, 'fc*.tif')),
+             output.vrt = file.path(path.output, "VRT_fc.vrt"))
+gdalbuildvrt(gdalfile = Sys.glob(file.path(path.input, 'srtm*.tif')),
+             output.vrt = file.path(path.output, "VRT_srtm.vrt"))
+gdalbuildvrt(gdalfile = Sys.glob(file.path(path.input, 'travel*.tif')),
+             output.vrt = file.path(path.output, "VRT_traveltime.vrt"))
+gdalbuildvrt(gdalfile = Sys.glob(file.path(path.input, 'clay*.tif')),
+             output.vrt = file.path(path.output, "VRT_clay.vrt"))
 
-fun.warp.fc = function(file){
-  newname = paste0("warped-", tail(strsplit(file, '/')[[1]], 1))
-  gdalwarp(srcfile = file,
-         dstfile = file.path(path.output, newname), # Output file in GDAL virtual file system
-         t_srs = paste0("EPSG:", utm_code),
-         tr = c(as.character(gridSize), as.character(gridSize)),
-         r = "sum",
-         ot = "UInt16")}
 
-lapply(f.fc, fun.warp.fc)
-
-#----------------------------------
 # Terrain Ruggedness Index (TRI)
-f.dem = Sys.glob(file.path(path.input, 'srtm*'))
-
+f.dem = Sys.glob(file.path(path.input, 'srtm*.tif'))
 fun.tri = function(file){
-  newname = paste0("tri-", tail(strsplit(file, '/')[[1]], 1))
+  #newname = paste0("tri-", tail(strsplit(file, '/')[[1]], 1))
   gdaldem(mode = "TRI", 
-        input_dem = file,
-        output_map = file.path(path.input, newname))
+          input_dem = file,
+          output_map = file.path(path.output, "tri.tif"))
 }
-
 lapply(f.dem, fun.tri)
 
+gdalbuildvrt(gdalfile = Sys.glob(file.path(path.output, 'tri*.tif')),
+             output.vrt = file.path(path.output, "VRT_tri.vrt"))
 
-#--------------------------------
-# Warp Other Variables: travel time, elevation, tri, clay content
-f.others = Sys.glob(file.path(path.input, '[!f]*.tif'))
 
-fun.warp.other = function(file){
-  newname = paste0("warped-", tail(strsplit(file, '/')[[1]], 1))
-  gdalwarp(srcfile = file,
-         dstfile = file.path(path.output, newname), # Output file in GDAL virtual file system
+#------------------------------------------------------------
+# GDAL: Align rasters by Warping
+extent.bbox = extent(bbox_prj)
+# Forest Cover
+gdalwarp(srcfile = Sys.glob(file.path(path.output, 'VRT_fc.vrt')),
+         dstfile = file.path(path.output, "wp_fc.vrt"),
          t_srs = paste0("EPSG:", utm_code),
+         te = c(extent.bbox[1], extent.bbox[3], extent.bbox[2], extent.bbox[4]),
+         tr = c(as.character(gridSize), as.character(gridSize)),
+         r = "sum",
+         ot = "UInt16",
+         #cutline = file.path(path.input, "gadm_prj.gpkg"),
+         #crop_to_cutline = TRUE,
+         dstnodata = NA,
+         overwrite = TRUE)
+
+# SRTM
+gdalwarp(srcfile = Sys.glob(file.path(path.output, 'VRT_srtm.vrt')),
+         dstfile = file.path(path.output, "wp_srtm.vrt"),
+         t_srs = paste0("EPSG:", utm_code),
+         te = c(extent.bbox[1], extent.bbox[3], extent.bbox[2], extent.bbox[4]),
+         #te = c(311443.29363404075, 7168029.484370736, 1095443.2936340407, 8678029.484370736),
          tr = c(as.character(gridSize), as.character(gridSize)),
          r = "average",
-         ot = "UInt16")
-}
+         ot = "UInt16",
+         #cutline = file.path(path.input, "gadm_prj.gpkg"),
+         #crop_to_cutline = TRUE,
+         dstnodata = NA,
+         overwrite = TRUE)
 
-lapply(f.others, fun.warp.other)
+# TRI
+gdalwarp(srcfile = Sys.glob(file.path(path.output, 'VRT_tri.vrt')),
+         dstfile = file.path(path.output, "wp_tri.vrt"),
+         t_srs = paste0("EPSG:", utm_code),
+         te = c(extent.bbox[1], extent.bbox[3], extent.bbox[2], extent.bbox[4]),
+         #te = c(311443.29363404075, 7168029.484370736, 1095443.2936340407, 8678029.484370736),
+         tr = c(as.character(gridSize), as.character(gridSize)),
+         r = "average",
+         ot = "Float32",
+         #cutline = file.path(path.input, "gadm_prj.gpkg"),
+         #crop_to_cutline = TRUE,
+         dstnodata = NA,
+         overwrite = TRUE)
 
+# Travel Time
+gdalwarp(srcfile = Sys.glob(file.path(path.output, 'VRT_traveltime.vrt')),
+         dstfile = file.path(path.output, "wp_traveltime.vrt"),
+         t_srs = paste0("EPSG:", utm_code),
+         te = c(extent.bbox[1], extent.bbox[3], extent.bbox[2], extent.bbox[4]),
+         #te = c(311443.29363404075, 7168029.484370736, 1095443.2936340407, 8678029.484370736),
+         tr = c(as.character(gridSize), as.character(gridSize)),
+         r = "average",
+         ot = "UInt16",
+         #cutline = file.path(path.input, "gadm_prj.gpkg"),
+         #crop_to_cutline = TRUE,
+         dstnodata = NA,
+         overwrite = TRUE)
+
+# Clay Content
+gdalwarp(srcfile = Sys.glob(file.path(path.output, 'VRT_clay.vrt')),
+         dstfile = file.path(path.output, "wp_clay.vrt"),
+         t_srs = paste0("EPSG:", utm_code),
+         te = c(extent.bbox[1], extent.bbox[3], extent.bbox[2], extent.bbox[4]),
+         #te = c(311443.29363404075, 7168029.484370736, 1095443.2936340407, 8678029.484370736),
+         tr = c(as.character(gridSize), as.character(gridSize)),
+         r = "average",
+         ot = "UInt16",
+         #cutline = file.path(path.input, "gadm_prj.gpkg"),
+         #crop_to_cutline = TRUE,
+         dstnodata = NA,
+         overwrite = TRUE)
 
 #------------------------------------------------------------
 # Rasters --> Dataframe
 
+lst_aligned_layers = file.path(path.output, "r_wdpaid_test.tif") %>%
+  append(file.path(path.output, "r_group_test.tif")) %>%
+  append(Sys.glob(file.path(path.output, "wp*[!fc].vrt"))) 
+
 rToDF = function(file){
   r = rast(file)
-  df = as.data.frame(r, na.rm=TRUE, xy=TRUE, centroids=TRUE)
+  df = as.data.frame(r, na.rm=TRUE, xy=TRUE, centroids=TRUE) %>%
+    select(-c(centroids))
+}
+# Load rasters of other covariates as DF, in list
+df.covar = lapply(lst_aligned_layers, FUN = rToDF)
+# Merge DFs
+df.merge.test = Reduce(function(x, y) merge(x, y, by=c("x","y")),
+                       df.covar)
+
+
+# Dataframe of Forest Cover
+df.fc = rToDF(file.path(path.output, "wp_fc.vrt"))
+# Rename df.fc
+fc.names.old = colnames(df.fc)[grepl("wp", colnames(df.fc))]
+fc.names.new = lapply(fc.names.old, function(i){
+  postfix = as.numeric(strsplit(i, "_")[[1]][3])-1+2000
+  newname = paste0("fc_percent_", postfix)
+}) %>% unlist()
+
+df.fc1 = df.fc %>% 
+  # Rename FC Columns
+  rename_with(~ fc.names.new, .cols = fc.names.old) %>%
+  # Calculate forest cover percentage in grid cells
+  mutate_at(fc.names.new, ~round((.*900)/(gridSize^2)*100, 1)) %>%
+  # if value > 100% by bias, set it to 100%
+  mutate_at(fc.names.new, ~replace(., .>100, 100))
+
+
+# Calculate Forest Loss Time Series
+# Add new columns: treeloss_tn = treecover_tn - treecover_t(n-1)
+for (i in 1:as.numeric(length(fc.names.new)-1)) {
+  # Drop the first year
+  dropFirst = tail(fc.names.new, -1)
+  # Drop the last year
+  dropLast = head(fc.names.new, -1)
+  # Forest Loss name postfix
+  postfix = dropFirst %>% strsplit(., "_")
+  # FL Column Name
+  fl.colname = paste0("fl_percent_", postfix[[i]][3])
+  # Add FL column
+  df.fc1[[fl.colname]] = df.fc1[[dropFirst[i]]] - df.fc1[[dropLast[i]]]
 }
 
-#-------------------
-# Forest Cover
-f.fc = Sys.glob(file.path(path.output, '*fc*'))
-df.fc = do.call("rbind", lapply(f.fc, FUN = rToDF)) %>%
-  # Transform warped rasters into dataframes, merge dfs by row
-  
-  # Turn df into projected geodataframe
+
+# Merge DFs
+df.merge = merge(df.merge.test, df.fc1, by=c("x","y"))
+# DF --> GDF
+gdf.merge = df.merge %>%
   st_as_sf(., coords = c("x", "y"),
-           crs = crs(gadm_prj)) %>%
-  
-  # Spatial join gdf with grid gdf, match unique gridID and observation
-  st_join(grid) %>% 
-  
-  # Remove observations not covered by grid
-  drop_na(gridID) %>%
-  
-  # Drop geometry, turn gdf into df, drop unneeded column
-  mutate(geometry = NULL) %>%
-  as.data.frame() %>%
-  select(-c(centroids)) %>%
-  
-  # Summarise observations with duplicated gridID
-  group_by(gridID) %>% 
-  summarise(across(everything(), list(sum)))
-  # Alternative: aggregate(.~gridID, gdf_fc, sum)
-
-# Rename df.fc
-oldnames = colnames(df.fc)[-1]
-newnames = lapply(oldnames, function(i){
-  strsplit(i, "_")[[1]][3]
-})
-newnames = paste0("fc_%_", unlist(newnames))
-df.fc = df.fc %>% 
-  rename_with(~ newnames, .cols = oldnames)
-
-# Calculate forests cover percentage in grid cells
-df.fc = df.fc %>%
-  mutate_at(newnames, ~round((.*900)/(gridSize^2)*100, 1)) %>%
-  mutate_at(newnames, ~replace(., .>100, 100))
-  # if value > 100% due to bias, set it to 100%
-  
-
-#-------------------
-# Travel Time
-f.travel = Sys.glob(file.path(path.output, '*travel*'))
-df.travel = do.call("rbind", lapply(f.travel, FUN = rToDF)) %>%
-  st_as_sf(., coords = c("x", "y"),
-           crs = crs(gadm_prj)) %>%
-  st_join(grid) %>% 
-  drop_na(gridID) %>%
-  mutate(geometry = NULL) %>%
-  as.data.frame() %>%
-  select(-c(centroids)) %>%
-  group_by(gridID) %>% 
-  summarise(across(everything(), list(mean)))
-# Rename Column
-colnames(df.travel)[2] = "accessiblity_min"
-
-
-# Clay Content
-f.clay = Sys.glob(file.path(path.output, '*clay*'))
-df.clay = do.call("rbind", lapply(f.clay, FUN = rToDF)) %>%
-  st_as_sf(., coords = c("x", "y"),
-           crs = crs(gadm_prj)) %>%
-  st_join(grid) %>% 
-  drop_na(gridID) %>%
-  mutate(geometry = NULL) %>%
-  as.data.frame() %>%
-  select(-c(centroids)) %>%
-  group_by(gridID) %>% 
-  summarise(across(everything(), list(mean)))
-# Rename Column
-colnames(df.clay)[2] = "clay_%_mean_0_20"
-
-
-# DEM
-f.dem = Sys.glob(file.path(path.output, '*[!tri]-srtm*'))
-df.dem = do.call("rbind", lapply(f.dem, FUN = rToDF)) %>%
-  st_as_sf(., coords = c("x", "y"),
-           crs = crs(gadm_prj)) %>%
-  st_join(grid) %>% 
-  drop_na(gridID) %>%
-  mutate(geometry = NULL) %>%
-  as.data.frame() %>%
-  select(-c(centroids)) %>%
-  group_by(gridID) %>% 
-  summarise(across(everything(), list(mean)))
-# Rename Column
-colnames(df.dem)[2] = "elevation_m"
-
-
-# TRI
-f.tri = Sys.glob(file.path(path.output, '*tri*'))
-df.tri = do.call("rbind", lapply(f.tri, FUN = rToDF)) %>%
-  st_as_sf(., coords = c("x", "y"),
-           crs = crs(gadm_prj)) %>%
-  st_join(grid) %>% 
-  drop_na(gridID) %>%
-  mutate(geometry = NULL) %>%
-  as.data.frame() %>%
-  select(-c(centroids)) %>%
-  group_by(gridID) %>% 
-  summarise(across(everything(), mean))
-# Rename Column
-colnames(df.tri)[2] = "TRI"
-
-
-# Groups and WDPA-ID
-df.group = rToDF(r.group) %>%
-  st_as_sf(., coords = c("x", "y"),
-           crs = crs(gadm_prj)) %>%
-  st_join(grid) %>%
-  drop_na(gridID) %>%
-  mutate(geometry = NULL) %>%
-  as.data.frame() %>%
-  select(-c(centroids)) %>%
-  # duplicated gridID hardly happens; only for just in case.
-  group_by(gridID) %>% 
-  summarise(across(everything(), max))
-
-df.wdpaid = rToDF(r.wdpaid) %>%
-  st_as_sf(., coords = c("x", "y"),
-           crs = crs(gadm_prj)) %>%
-  st_join(grid) %>%
-  drop_na(gridID) %>%
-  mutate(geometry = NULL) %>%
-  as.data.frame() %>%
-  select(-c(centroids)) %>%
-  group_by(gridID) %>% 
-  summarise(across(everything(), max))
-
-df.grid = df.group %>% inner_join(df.wdpaid)
-rm(df.group, df.wdpaid)
-
-mf = grid %>%
-  inner_join(df.grid) %>%
-  inner_join(df.fc) %>%
-  inner_join(df.dem) %>%
-  inner_join(df.tri) %>%
-  inner_join(df.travel) %>%
-  inner_join(df.clay) 
-
-# Export projected GADM for use in GDAL
-st_write(mf, 
-         dsn = file.path(path.output, paste0("mf_rBase_1km_", country, ".gpkg")), 
-         delete_dsn = TRUE) 
-  
+           crs = utm_code) %>%
+  st_transform(crs = 4326)
